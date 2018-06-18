@@ -1,0 +1,9 @@
+/*.qch
+/*.qhp
+/images/
+/html.*/
+/venv/
+/virtualenv/
+*.pyc
+*.pyo
+
