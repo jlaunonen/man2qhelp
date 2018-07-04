@@ -4,34 +4,41 @@
 # Copyright (c) 2018 Jyrki Launonen
 
 import argparse
+from collections import OrderedDict
 import glob
 import os.path
 import re
 import subprocess
 import sys
 from html.parser import HTMLParser
-from typing import Optional, Tuple, List
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 
+__version__ = "0.2"
+
+DEFAULT_NAMESPACE = "man.linux.org.1.0"
 IN_PATH = "/usr/share/man/man%s"
 MAN_LINK = re.compile(r"<b>(\w+)</b>\((\d+p?)\)")
+IMAGE_NAME_RE = re.compile(r"(?P<keyword>.+?)-\d+\.\w+")
 QHP_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <QtHelpProject version="1.0">
-<namespace>man.linux.org.1.0</namespace>
-<virtualFolder>html</virtualFolder>
+<namespace>{namespace}</namespace>
+<virtualFolder>man-pages</virtualFolder>
 <customFilter name="Linux Man 1.0">
     <filterAttribute>man</filterAttribute>
 </customFilter>
-<filterSection>
+""", """</QtHelpProject>
+"""
+CATEGORY_TEMPLATE = """<filterSection>
     <filterAttribute>man</filterAttribute>
+    <filterAttribute>{filter_category}</filterAttribute>
     <keywords>
-""", """
+""", """\
     </keywords>
     <files>
-""", """
+""", """\
     </files>
 </filterSection>
-</QtHelpProject>
 """
 
 
@@ -43,6 +50,23 @@ class BasePath(object):
         return os.path.join(self._path, *paths)
 
 
+Options = NamedTuple("Options", [
+    ("cache_path", BasePath),
+    ("qhp", str),
+    ("force", bool),
+    ("sources", List[str]),
+    ("qhp_namespace", str),
+    ("quiet", bool),
+    ("print", Callable)
+])
+
+LevelResult = NamedTuple("LevelResult", [
+    ("keywords", List["Keyword"]),
+    ("cross_references", List[Tuple[str, str]]),
+    ("has_errors", bool),
+])
+
+
 def man_path(level: int, page: Optional[str]=None) -> str:
     if page is None:
         return IN_PATH % level
@@ -50,7 +74,7 @@ def man_path(level: int, page: Optional[str]=None) -> str:
 
 
 def src_bzip(path: str) -> str:
-    return subprocess.check_output(["bunzip2", "-c", path]).decode("utf-8")
+    return subprocess.check_output(["bunzip2", "-c", path]).decode("utf-8", errors="replace")
 
 
 def src_raw(path: str) -> str:
@@ -87,10 +111,18 @@ def src(path: str) -> Optional[Tuple[Optional[str], str, Optional[str]]]:
     if data.startswith(".so "):
         alias = data.strip().split("\n")
         if len(alias) == 1:
-            alias = alias[0].split(" ")[1]
-            alias_info = re.match(r"man(\d+)/(\w+)", alias)
+            alias = alias[0]
+            alias_info = re.match(r"\.so\s+(?:.*?/)?man(\d+)/([\w_-]+)", alias)
+            if alias_info is not None:
+                alias_path = man_path(int(alias_info.group(1)), alias_info.group(2))
+            else:
+                alias_info = re.match(r"\.so\s+([\w_-]+\.(\d))", alias)
+                if alias_info is not None:
+                    alias_path = man_path(int(alias_info.group(2)), alias_info.group(1))
+                else:
+                    print("not understood alias:", name, data)
+                    return None
 
-            alias_path = man_path(int(alias_info.group(1)), alias_info.group(2))
             candidates = glob.glob(alias_path + ".*")
             if len(candidates) == 0:
                 print("No matching alias source:", alias_path)
@@ -146,8 +178,13 @@ def title_tag(text: str) -> str:
 class Keyword(object):
     def __init__(self, keyword: str, target: str, is_alias: bool = False):
         self.keyword = keyword
+        "Keyword, such as `select`."
+
         self.target = target
+        "Output or target filename."
+
         self.is_alias = is_alias
+        "If `True`, `target` points to the alias target."
 
 
 def link_replacer(ref_list: List[Tuple[str, str]]):
@@ -159,18 +196,21 @@ def link_replacer(ref_list: List[Tuple[str, str]]):
     return fn
 
 
-def do_level(cache_path: BasePath, level: str, force: bool = False) ->\
-        Tuple[List[Keyword], List[Tuple[str, str]], bool]:
+def do_level(level: str, options: Options) -> LevelResult:
     level_keywords = []  # type: List[Keyword]
     cross_references = []  # type: List[Tuple[str, str]]
     has_errors = False
 
-    out_dir = cache_path.join("html.%s" % level)
+    out_dir = options.cache_path.join("html.%s" % level)
     if not os.path.exists(out_dir):
         os.mkdir(out_dir)
+    images_dir = os.path.join(out_dir, "images")
+    if not os.path.exists(images_dir):
+        os.mkdir(images_dir)
     in_dir = IN_PATH % level
 
     # Needed for images to work correctly with relative path.
+    original_dir = os.getcwd()
     os.chdir(out_dir)
 
     for f in os.listdir(in_dir):
@@ -184,22 +224,26 @@ def do_level(cache_path: BasePath, level: str, force: bool = False) ->\
 
         if man_data is None:
             base_name = result_name(alias, level)
-            target = cache_path.join("html.%s" % level, base_name)
-            print("alias", name, "=", target)
+            target = options.cache_path.join("html.%s" % level, base_name)
+            options.print("alias", name, "=", target)
             level_keywords.append(Keyword(name, target, is_alias=True))
             continue
 
         base_name = result_name(name, level)
+        target = options.cache_path.join("html.%s" % level, base_name)
         out_file = base_name
 
-        if not force and os.path.exists(out_file) and abs(os.path.getmtime(out_file) - source_mtime) < 1.0:
-            print("keyword", name, "=", out_file, "[UNCHANGED %s]" % str(os.path.getmtime(out_file) - source_mtime))
+        level_keywords.append(Keyword(name, target))
+
+        if not options.force and os.path.exists(out_file) and abs(os.path.getmtime(out_file) - source_mtime) < 1.0:
+            options.print("keyword", name, "=", out_file, " # UNCHANGED delta %ss" %
+                          str(os.path.getmtime(out_file) - source_mtime))
             continue
-        print("keyword", name, "=", out_file)
+        options.print("keyword", name, "=", target)
 
         # Define path and name for images.
         image_args = [
-            "-P", "-D" + os.path.join("..", "images"),
+            "-P", "-D" + "images",
             "-P", "-I" + name + "-",
         ]
         process = subprocess.run("groff -t -m mandoc -mwww -Thtml".split() + image_args,
@@ -222,38 +266,63 @@ def do_level(cache_path: BasePath, level: str, force: bool = False) ->\
         # Replace all cross-references to other man-pages with links to them, regardless whether they exist or not.
         html_data = MAN_LINK.sub(link_replacer(cross_references), html_data)
 
-        level_keywords.append(Keyword(name, out_file))
-
         with open(out_file, "w") as o:
             o.write(html_data)
 
         # Set result file modification time to source time to allow checking changes in future.
         os.utime(out_file, (source_mtime, source_mtime))
 
-    return level_keywords, cross_references, has_errors
+    # Restore working directory.
+    os.chdir(original_dir)
+
+    level_files = set(os.path.basename(kw.target) for kw in level_keywords if not kw.is_alias)
+    for file in os.listdir(out_dir):
+        if os.path.isfile(file) and file not in level_files:
+            to_remove = os.path.join(out_dir, file)
+            options.print("delete", to_remove)
+            os.remove(to_remove)
+
+    keywords = set(kw.keyword for kw in level_keywords if not kw.is_alias)
+    for file in os.listdir(images_dir):
+        match = IMAGE_NAME_RE.match(file)
+        if match is not None:
+            kw = match.group(1)
+            if kw in keywords:
+                continue
+        to_remove = os.path.join(images_dir, file)
+        options.print("delete", to_remove)
+        os.remove(to_remove)
+
+    return LevelResult(level_keywords, cross_references, has_errors)
 
 
-def do_levels(cache_path: BasePath, force: bool, *levels: str):
-    kws = []
+def do_levels(options: Options):
+    kws = OrderedDict()
     cross_references = []
     has_errors = False
-    for level in levels:
-        lkw, cross, errors = do_level(cache_path, level, force)
-        kws.extend(lkw)
+    for level in options.sources:
+        options.print("category", level)
+        lkw, cross, errors = do_level(level, options)
+        options.print("end category", level)
+        kws[level] = lkw
         cross_references.extend(cross)
         has_errors |= errors
 
-    catalog = cache_path.join("man.qhp")
+    # Qt Help requires that the files included and the project file are in same directory.
+    catalog = options.cache_path.join(options.qhp)
     with open(catalog, "w") as o:
-        o.write(QHP_TEMPLATE[0])
-        for kw in kws:
-            o.write('        <keyword name="{}" ref="{}" />\n'.format(kw.keyword, kw.target))
-        o.write(QHP_TEMPLATE[1])
-        for level in levels:
+        o.write(QHP_TEMPLATE[0].format(namespace=options.qhp_namespace))
+        for level, keywords in kws.items():
+            o.write(CATEGORY_TEMPLATE[0].format(filter_category="man" + str(level)))
+            for kw in keywords:
+                o.write('        <keyword name="{}" ref="{}" />\n'.format(kw.keyword, kw.target))
+            o.write(CATEGORY_TEMPLATE[1])
             o.write("        <file>html." + level + "/*.html</file>\n")
-        o.write("        <file>images/*</file>\n")
-        o.write(QHP_TEMPLATE[2])
-    print("wrote catalog to", catalog)
+            o.write("        <file>html." + level + "/images/*</file>\n")
+            o.write(CATEGORY_TEMPLATE[2])
+
+        o.write(QHP_TEMPLATE[1])
+    print("Wrote catalog to", catalog)
     if has_errors:
         print("Processing had errors and some files were skipped.")
     else:
@@ -277,16 +346,28 @@ def check_system() -> bool:
 
 def make_argument_parser():
     parser = argparse.ArgumentParser(
-        description="man-page to Qt Help converter"
+        description="man-page to Qt Help converter."
     )
-    parser.add_argument("levels", action="append", metavar="LEVEL",
+    parser.add_argument("levels", nargs="+", metavar="LEVEL",
                         help="man-page level to add for conversion, such as 2")
     parser.add_argument("--cache-dir", type=str, metavar="DIR", default=".",
                         help="Use given cache root directory instead of current directory.")
     parser.add_argument("-f", "--force", action="store_true", default=False,
                         help="Re-write all files.")
+    parser.add_argument("-o", "--output", type=str, default="man.qhp",
+                        help="Write to given file instead of man.qhp."
+                             " Note, the file will be forced into the cache directory!")
     parser.add_argument("--ignore-system-check", action="store_true", default=False,
                         help="Ignore system check results and process anyways.")
+    parser.add_argument("-q", "--quiet", action="store_true", default=False,
+                        help="Make less noise.")
+
+    qhp = parser.add_argument_group("Qt Help Project options")
+    qhp.add_argument("--namespace", default=DEFAULT_NAMESPACE,
+                     help="Namespace to use instead of %s" % DEFAULT_NAMESPACE)
+
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
+
     return parser
 
 
@@ -297,7 +378,22 @@ def main(*argv):
     if not (check_system() or args.ignore_system_check):
         sys.exit(1)
 
-    do_levels(BasePath(args.cache_dir), args.force, *args.levels)
+    quiet = args.quiet
+
+    def q_print(*p_args, **p_kwargs):
+        if not quiet:
+            print(*p_args, **p_kwargs)
+
+    options = Options(
+        cache_path=BasePath(args.cache_dir),
+        qhp=os.path.basename(args.output),
+        force=args.force,
+        sources=args.levels,
+        qhp_namespace=args.namespace,
+        quiet=args.quiet,
+        print=q_print,
+    )
+    do_levels(options)
 
 
 if __name__ == "__main__":

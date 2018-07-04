@@ -20,7 +20,6 @@ file to registered documentation. Now the man2 category pages can be accessed fr
 ## Known problems / limitations
 
 - groffhtml converts tables to images instead of using `<table>` element.
-- Caching does not work yet correctly. Using `-f` argument for the script may be required.
 - Cross-references are not checked and the resulting link may be broken.
-- Converting only single page, multiple categories, or combination of those is not tested.
-- Output filename is hard-coded and filtering or help options cannot be changed.
+- Converting only single page or explicit pages is not supported or tested.
+- Output file must be located in cache directory. This is requirement by Qt Help.
