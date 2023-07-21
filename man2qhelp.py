@@ -77,6 +77,10 @@ def src_bzip(path: str) -> str:
     return subprocess.check_output(["bunzip2", "-c", path]).decode("utf-8", errors="replace")
 
 
+def src_gzip(path: str) -> str:
+    return subprocess.check_output(["gunzip", "-c", path]).decode("utf-8", errors="replace")
+
+
 def src_raw(path: str) -> str:
     with open(path, "r") as f:
         return f.read()
@@ -102,6 +106,9 @@ def src(path: str) -> Optional[Tuple[Optional[str], str, Optional[str]]]:
     base = os.path.basename(path)
     if path.endswith(".bz2"):
         data = src_bzip(path)
+        name = os.path.splitext(base)[0]
+    elif path.endswith(".gz"):
+        data = src_gzip(path)
         name = os.path.splitext(base)[0]
     else:
         data = src_raw(path)
